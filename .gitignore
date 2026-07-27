@@ -1,0 +1,22 @@
+# Build output
+.gradle/
+build/
+
+# IDEs
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.vscode/
+.classpath
+.project
+.settings/
+bin/
+
+# macOS
+.DS_Store
+
+# Burp project files
+*.burp
+*.burp.backup
