@@ -49,6 +49,10 @@ import javax.swing.ListSelectionModel;
  */
 public final class ProfilesPanel {
 
+    /** Indices into the unsaved-edits dialog's own answer array (showOptionDialog returns a position). */
+    private static final int SAVE_ANSWER = 0;
+    private static final int DISCARD_ANSWER = 1;
+
     private final MontoyaApi api;
     private final ProfileRegistry registry;
     private final ProfileStore store;
@@ -71,9 +75,13 @@ public final class ProfilesPanel {
         this.store = store;
         this.config = new ProfileConfigPanel(new ProfileValidator(), this::onSaveProfile);
 
+        // Repaint on every dirty flip so the marker appears with the first keystroke rather than at the next
+        // selection change - the whole point of it is to be there BEFORE the click that would discard.
+        this.config.setOnDirtyChanged(list::repaint);
+
         list.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         list.setCellRenderer((jlist, value, index, sel, focus) -> {
-            JLabel l = new JLabel(renderRow(value));
+            JLabel l = new JLabel(renderRow(value, hasUnsavedEdits(value)));
             l.setOpaque(true);
             l.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
             if (sel) {
@@ -144,10 +152,15 @@ public final class ProfilesPanel {
 
     // ---- list cell rendering -------------------------------------------------------------------
 
-    /** A row label: enabled mark + name + AUTO tags + a not-active hint. Arm ⟹ enabled, so there is no
-     * "auto-only" (armed-but-disabled) state: a disabled profile is fully inactive. */
-    private static String renderRow(TargetProfile p) {
-        StringBuilder sb = new StringBuilder(p.enabled() ? "☑ " : "☐ ");
+    /** A row label: unsaved marker + enabled mark + name + AUTO tags + a not-active hint. Arm ⟹ enabled, so
+     * there is no "auto-only" (armed-but-disabled) state: a disabled profile is fully inactive. */
+    private static String renderRow(TargetProfile p, boolean unsaved) {
+        // The marker leads the row, over a two-space gutter on every other row so the glyphs stay roughly
+        // columnar as a row goes dirty (roughly, not exactly - the label font is proportional). It has to be
+        // on the LIST, not on the editor: the moment the edits are at risk is the click on another row, and
+        // that is where the eye already is.
+        StringBuilder sb = new StringBuilder(unsaved ? "• " : "  ");
+        sb.append(p.enabled() ? "☑ " : "☐ ");
         sb.append(p.name());
         if (p.autoPlant()) {
             sb.append("  [auto-plant]");
@@ -159,6 +172,11 @@ public final class ProfilesPanel {
             sb.append("  [not active]"); // disabled ⇒ no tab, no colour, no auto
         }
         return sb.toString();
+    }
+
+    /** True for the one row the editor is holding, when that editor has edits Save has not seen. */
+    private boolean hasUnsavedEdits(TargetProfile p) {
+        return p != null && editingId != null && config.isDirty() && editingId.equals(p.id());
     }
 
     private static Color rowColor(TargetProfile p, Color normal) {
@@ -174,13 +192,102 @@ public final class ProfilesPanel {
         if (rebuilding) {
             return; // ignore the synthetic null selection a list rebuild fires
         }
-        TargetProfile p = list.getSelectedValue();
-        editingId = p != null ? p.id() : null;
-        editingDefault = p != null && p == registry.defaultProfile(); // the pinned top row, by reference
-        config.setProfile(p, editingDefault);
+        // Read the click before anything can move the selection again: the Save answer below re-selects the
+        // row it wrote, so by the time the guard returns the list no longer remembers what was asked for.
+        TargetProfile picked = list.getSelectedValue();
+        if (!guardUnsavedEdits(picked)) {
+            return; // cancelled, or a save the panel rejected - the guard has put the selection back
+        }
+        // Re-read rather than load `picked`. Answering Save runs a full registry mutation and list rebuild in
+        // between, and `picked` is a pre-mutation reference that the save may have EVICTED: renaming a
+        // profile's id onto another profile's makes ProfileRegistry.replace drop that other holder to free the
+        // id. Loading the stale object then puts a profile the registry no longer has into the editor under an
+        // id that now belongs to something else, and the next Save writes the phantom over the profile the
+        // operator just chose to save. Whatever the rebuilt list is pointing at is the profile that exists.
+        TargetProfile loaded = list.getSelectedValue();
+        editingId = loaded != null ? loaded.id() : null;
+        editingDefault = loaded != null && loaded == registry.defaultProfile(); // the pinned top row, by reference
+        config.setProfile(loaded, editingDefault);
+    }
+
+    /**
+     * Ask before a selection change overwrites unsaved edits, and answer whether the change may proceed.
+     *
+     * Selecting a row loads it over every field in the config panel, so a half-typed profile disappears on the
+     * click that was only meant to look at another one. Saving per keystroke is NOT the fix: the profile drives
+     * both detection and live-traffic rewriting, so it would arm partial state mid-typing - and Save is the
+     * validation gate (it is precisely where a blank pattern is rejected). Prompting keeps the gate and still
+     * makes the loss impossible to hit by accident.
+     */
+    private boolean guardUnsavedEdits(TargetProfile picked) {
+        if (!config.isDirty()) {
+            return true;
+        }
+        String label = editingId != null ? editingId : "this profile";
+        // showOptionDialog, not showConfirmDialog: YES_NO_CANCEL_OPTION renders "Yes / No / Cancel", which
+        // leaves the operator to work out that "No" is the button that throws their typing away. Naming the
+        // three answers is the whole point of asking.
+        Object[] answers = {"Save", "Discard", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(frame(),
+                "Profile '" + label + "' has unsaved changes. Save them before switching?",
+                "Passkey Editor", JOptionPane.DEFAULT_OPTION, JOptionPane.WARNING_MESSAGE, null,
+                answers, answers[0]);
+        if (choice == SAVE_ANSWER) {
+            config.saveNow(); // the button's own path, validation gate included
+            if (config.isDirty()) {
+                // Rejected (a missing id, a blank SUFFIX/REGEX host, no field configured). The panel has
+                // written the reason to its status line; keep the operator on the profile that reason is
+                // about instead of discarding it behind a dialog they thought had saved.
+                restoreSelection();
+                return false;
+            }
+            // A successful save re-selected the row it wrote. Put the operator's actual click back before the
+            // caller loads it, or "Save then switch" would silently land on the profile just saved.
+            selectQuietly(picked);
+            return true;
+        }
+        if (choice == DISCARD_ANSWER) {
+            return true; // discard: the caller is about to load over the edits, which is what was asked
+        }
+        restoreSelection(); // Cancel, or the dialog dismissed (CLOSED_OPTION)
+        return false;
+    }
+
+    /** Re-select the row still loaded in the editor, so a cancelled switch leaves the list where it was. */
+    private void restoreSelection() {
+        selectQuietly(editingId);
+    }
+
+    private void selectQuietly(TargetProfile p) {
+        selectQuietly(p != null ? p.id() : null);
+    }
+
+    /**
+     * Drive the list selection without re-entering {@link #onSelect}. Reuses the {@code rebuilding} guard the
+     * list rebuild already relies on: this is the same situation - the selection is being set by the panel
+     * rather than clicked by the operator, so it must not re-run the guard that brought us here.
+     */
+    private void selectQuietly(String id) {
+        rebuilding = true;
+        try {
+            if (id == null) {
+                list.clearSelection();
+            } else {
+                selectById(id);
+            }
+        } finally {
+            rebuilding = false;
+        }
     }
 
     private void onAdd() {
+        // Ask BEFORE mutating. These handlers end in a selectById that re-enters onSelect and so would hit the
+        // guard anyway - but by then the new profile is already in the registry and on disk, so answering
+        // Cancel would keep the edits and still leave an unwanted row behind. Settle the panel first, and
+        // Cancel means nothing happened at all.
+        if (!guardUnsavedEdits(list.getSelectedValue())) {
+            return;
+        }
         String id = uniqueId("new-profile");
         TargetProfile blank = new TargetProfile(id, "New profile", HostMatch.exact("example.com"), Map.of(), false);
         registry.add(blank);
@@ -194,6 +301,9 @@ public final class ProfilesPanel {
         TargetProfile p = list.getSelectedValue();
         if (p == null) {
             info("Select a profile to copy.");
+            return;
+        }
+        if (!guardUnsavedEdits(p)) { // same reason as onAdd: do not persist a copy the operator then cancels
             return;
         }
         String id = uniqueId(p.id() + "-copy");
@@ -243,6 +353,14 @@ public final class ProfilesPanel {
      * Burp project. Scoped strictly to the Default: the operator's own profiles are untouched.
      */
     private void onResetDefault() {
+        // This ends in config.setProfile(null), which wipes the editor - so if another profile is loaded with
+        // unsaved edits, resetting the Default silently destroys them. That is the exact loss the unsaved-edit
+        // guard exists to prevent, and this action's own wording ("Your other profiles are not affected")
+        // actively promises it will not happen. Ask first, and before the reset's own confirm, so Cancel here
+        // leaves both the Default and the edits untouched.
+        if (!guardUnsavedEdits(list.getSelectedValue())) {
+            return;
+        }
         if (!confirm("Restore the Default profile to its shipped configuration? "
                 + "Your other profiles are not affected.")) {
             return;
@@ -315,6 +433,10 @@ public final class ProfilesPanel {
     private String uniqueId(String base) {
         Set<String> ids = new HashSet<>();
         registry.profiles().forEach(p -> ids.add(p.id()));
+        // The Default is not in profiles() but IS a row, and every id lookup here (selectById, the unsaved
+        // marker) resolves first-match over the model with the Default pinned at index 0. A listed profile
+        // that took its id would shadow it in all of them.
+        ids.add(registry.defaultProfile().id());
         if (!ids.contains(base)) {
             return base;
         }

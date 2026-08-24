@@ -5,7 +5,7 @@ plugins {
 // The single source of truth for the extension version. It is filtered into
 // src/main/resources/passkey-editor.properties below and read back at runtime, so the About tab and the
 // prefilled issue links always report the version this jar was actually built from.
-version = "1.0.0"
+version = "1.0.1"
 
 repositories {
     mavenCentral()

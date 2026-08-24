@@ -48,6 +48,37 @@ final class UiStyle {
         return h;
     }
 
+    /**
+     * A tooltip string that is safe to hand to Swing, and nothing more.
+     *
+     * Tooltips here are PLAIN TEXT and must stay short, because Swing gives no way to make a long one
+     * readable: a plain tooltip is laid out on a single line however long it is, and the usual escape hatch -
+     * wrapping it in {@code <html>} with explicit {@code <br>} - does not survive Burp, which paints the
+     * markup literally. (Measured on both Metal and FlatLaf: HTML without {@code <br>} does not wrap either,
+     * it just runs to a thousand pixels, so the markup was never buying anything but the breaks.) Anything
+     * that needs more than a line belongs in the Guide tab, which is a real HTML pane.
+     *
+     * The one thing this does is neutralise a value that would be parsed as markup. These tips carry text the
+     * operator typed - a regex, a located wire value - and Swing renders a string starting with {@code <html>}
+     * as HTML wherever it appears, so a value that happens to begin that way would come out as a mangled
+     * fragment instead of the value being inspected.
+     */
+    static String tip(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        return text.stripLeading().regionMatches(true, 0, "<html", 0, 5) ? " " + text : text;
+    }
+
+    /**
+     * {@code text} cut to {@code max} characters with an ellipsis, or unchanged if it already fits. For
+     * putting a value of the operator's - or the relying party's - choosing into a tooltip, where a single
+     * long one would set the width of the whole thing.
+     */
+    static String abbreviate(String text, int max) {
+        return text == null || text.length() <= max ? text : text.substring(0, max) + "\u2026";
+    }
+
     /** {@code #rrggbb} for use inside an inline style attribute. */
     static String hex(Color c) {
         return String.format("#%02x%02x%02x", c.getRed(), c.getGreen(), c.getBlue());

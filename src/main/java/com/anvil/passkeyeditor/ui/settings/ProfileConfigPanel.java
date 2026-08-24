@@ -35,14 +35,18 @@ import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.FontMetrics;
 import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.LayoutManager;
 import java.awt.Rectangle;
+import java.awt.RenderingHints;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseWheelEvent;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -64,6 +68,7 @@ import javax.swing.JPanel;
 import javax.swing.JRadioButton;
 import javax.swing.JViewport;
 import javax.swing.SwingUtilities;
+import javax.swing.JScrollBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
@@ -87,18 +92,22 @@ public final class ProfileConfigPanel {
     private static final Field[] AUTH_FIELDS =
             {Field.CLIENT_DATA_JSON, Field.AUTHENTICATOR_DATA, Field.SIGNATURE, Field.USER_HANDLE, Field.CREDENTIAL_ID};
 
-    private static final String AUTO_PLANT_TIP = "AUTO substitutes OUR key into matching registrations "
-            + "(REG_VERIFY) in-flight, a larger blast radius. Off by default; every action is logged and "
-            + "highlighted ORANGE in Proxy history. Arming this auto-ticks Enabled. Acts on EVERY host this "
-            + "profile's host-match covers, regardless of Burp target scope. Use a specific host match.";
-    private static final String AUTO_RESIGN_TIP = "AUTO re-signs matching authentications (AUTH_VERIFY) with "
-            + "the key we hold. It prefers the key stored for that exact credential; holding exactly ONE key "
-            + "it uses that key even for an unmatched credential (logged as MOST-RECENT FALLBACK), and with "
-            + "two or more keys held an unmatched credential passes through. Off by default; logged and highlighted "
-            + "ORANGE in Proxy history. Arming this auto-ticks Enabled. Acts on EVERY host this profile's "
-            + "host-match covers, regardless of Burp target scope. Use a specific host match.";
+    // The two AUTO warnings are the highest-stakes strings in the panel and were the least readable: a
+    // tooltip cannot wrap (see UiStyle.tip), so at 324 and 515 characters they rendered 1923px and 3110px
+    // wide - off the side of the screen, with the blast-radius sentence among the parts you could not read.
+    // What survives here is only what has to be read BEFORE ticking the box: it changes live traffic, and it
+    // does so on every host the profile matches whatever Burp's scope says. The mechanism - key precedence,
+    // the most-recent fallback, session-only key storage, which tools it applies in - is unchanged and lives
+    // in the Guide tab's "AUTO mode" section, which is a real HTML pane and can afford it.
+    private static final String AUTO_PLANT_TIP = "Plants our key into LIVE registrations on every host this "
+            + "profile matches, in or out of Burp scope. See the Guide tab.";
+    private static final String AUTO_RESIGN_TIP = "Re-signs LIVE authentications on every host this profile "
+            + "matches, in or out of Burp scope. See the Guide tab.";
     private static final String DEFAULT_AUTO_TIP = "The Default matches every host, so it "
             + "can't be AUTO-armed. Create a host-specific profile to arm AUTO.";
+    /** The host row's counterpart of {@code URL_TIP}, and under the same one-line budget. */
+    private static final String HOST_TIP =
+            "Matched against the host of the ceremony request, often not the site you are browsing.";
 
     /** Pretty-printer for the Prettify button - HTML-escaping off so '=', '<', '&' in bodies stay literal. */
     private static final Gson PRETTY = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
@@ -113,8 +122,9 @@ public final class ProfileConfigPanel {
 
     private final JTextField idField = new JTextField(18);
     private final JTextField nameField = new JTextField(22);
+    private final JLabel hostLabel = new JLabel("host match:");
     private final JComboBox<HostMatch.Kind> hostKind = new JComboBox<>(HostMatch.Kind.values());
-    private final JTextField hostPattern = new JTextField(20);
+    private final HintField hostPattern = new HintField(20);
     // enabledBox / autoPlantBox / autoResignBox / saveButton are package-private (not private) so the
     // same-package ProfileConfigPanelBug1Test can drive doClick() / setSelected() and assert the captured
     // Save profile - pinning the un-tick-clears-AUTO + authoritative-buildProfile contract headlessly.
@@ -136,7 +146,9 @@ public final class ProfileConfigPanel {
     final JTextArea authBody = bodyArea();
     final JButton checkButton = new JButton("Check");
     private final JButton prettifyButton = new JButton("Prettify JSON");
-    final JButton saveButton = new JButton("Save profile");
+    /** Base text for the Save button; {@link #applySaveEmphasis} appends the unsaved marker to it. */
+    private static final String SAVE_LABEL = "Save profile";
+    final JButton saveButton = new JButton(SAVE_LABEL);
     final JLabel status = new JLabel(" ");
     /** Red warning shown only while an AUTO flag is armed - toggled by {@link #updateAutoCaption()}. */
     private final JLabel autoCaption = new JLabel("AUTO rewrites live traffic");
@@ -147,6 +159,15 @@ public final class ProfileConfigPanel {
     private boolean isDefaultProfile;
     /** True while {@link #setProfile} is populating the controls - suppresses live re-check on programmatic edits. */
     private boolean loading;
+    /**
+     * True when the operator has changed a control since the profile was loaded or last saved. Save is the
+     * validation gate (blank patterns are rejected there, and the profile drives both detection and live-traffic
+     * rewriting), so nothing is written per keystroke - this flag is what lets the list warn before a selection
+     * change overwrites the panel.
+     */
+    private boolean dirty;
+    /** Fired whenever {@link #dirty} flips, so the profile list can repaint its unsaved marker. */
+    private Runnable onDirtyChanged = () -> { };
     /** Debounce for live re-check: a locator/encoding edit restarts it; on fire it re-runs {@link #onCheck()}. */
     private final javax.swing.Timer liveTimer;
 
@@ -165,6 +186,25 @@ public final class ProfileConfigPanel {
         // the moment a body is pasted and update as either the body or a locator changes.
         onDocumentChange(regBody.getDocument(), this::scheduleLiveRecheck);
         onDocumentChange(authBody.getDocument(), this::scheduleLiveRecheck);
+
+        // Unsaved-edit tracking. The locator rows and the sample bodies already route through
+        // scheduleLiveRecheck, which marks dirty on the way past; everything else in the panel is wired here
+        // so no editable control can change the profile silently. Each hook is suppressed while setProfile is
+        // populating (markDirty honours the same `loading` flag the live re-check does), which matters because
+        // a JComboBox DOES fire an ActionEvent on setSelectedItem - unlike a JCheckBox's setSelected.
+        onDocumentChange(idField.getDocument(), this::markDirty);
+        onDocumentChange(nameField.getDocument(), this::markDirty);
+        onDocumentChange(hostPattern.getDocument(), this::markDirty);
+        hostLabel.setToolTipText(HOST_TIP);
+        hostPattern.setToolTipText(HOST_TIP);
+        hostKind.addActionListener(e -> {
+            applyHostKind();
+            markDirty();
+        });
+        algCombo.addActionListener(e -> markDirty());
+        attestationCombo.addActionListener(e -> markDirty());
+        regEditor.setOnDirty(this::markDirty);
+        authEditor.setOnDirty(this::markDirty);
 
         title.setFont(Fonts.ui().deriveFont(Font.BOLD, Fonts.ui().getSize() + 2f)); // colour comes from onTheme
 
@@ -189,6 +229,7 @@ public final class ProfileConfigPanel {
                 enabledBox.setSelected(true);
             }
             updateAutoCaption();
+            markDirty();
         };
         autoPlantBox.addActionListener(armTicksEnabled);
         autoResignBox.addActionListener(armTicksEnabled);
@@ -198,6 +239,7 @@ public final class ProfileConfigPanel {
                 autoResignBox.setSelected(false);
             }
             updateAutoCaption();
+            markDirty();
         });
         // autoCaption's colour is registered with the root once it exists, at the end of the constructor.
 
@@ -210,26 +252,43 @@ public final class ProfileConfigPanel {
         header.add(UiStyle.underline(title));
         header.add(leftRow(enabledBox, autoPlantBox, autoResignBox, Box.createHorizontalStrut(12), autoCaption));
         header.add(leftRow(new JLabel("id:"), idField, new JLabel("  name:"), nameField));
-        header.add(leftRow(new JLabel("host match:"), hostKind, hostPattern));
+        header.add(leftRow(hostLabel, hostKind, hostPattern));
         header.add(leftRow(new JLabel("default signing alg:"), algCombo,
                 new JLabel("  plant attestation:"), attestationCombo));
         header.setBorder(BorderFactory.createEmptyBorder(0, 6, 6, 6));
 
-        // Box 4: the sample bodies + Check/Save actions, in one titled panel. RigidHeightPanel so the GridBag
-        // glue can't flatten the (scroll-pane-backed) body boxes when the pane is short - it scrolls instead.
+        // Box 4: the two sample bodies, in one titled panel (the Check/Save row that used to close it is now
+        // the footer - see below). RigidHeightPanel so the GridBag glue can't flatten the (scroll-pane-backed)
+        // body boxes when the pane is short - it scrolls instead.
         JPanel bodies = new RigidHeightPanel();
         bodies.setLayout(new BoxLayout(bodies, BoxLayout.Y_AXIS));
         bodies.add(labeled("Registration body (paste the reg-verify request body):", regBody));
         bodies.add(Box.createVerticalStrut(4));
         bodies.add(labeled("Authentication body (paste the auth-verify request body):", authBody));
-        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        actions.setAlignmentX(Component.LEFT_ALIGNMENT);
-        actions.add(checkButton);
-        actions.add(prettifyButton);
-        actions.add(saveButton);
-        actions.add(status);
-        bodies.add(actions);
         bodies.setBorder(BorderFactory.createTitledBorder("Sample bodies"));
+
+        // The action row is CHROME, not content. As the last child of the "Sample bodies" box it lived inside
+        // the scrolled column, so with the two body boxes at their natural height it sat below the fold at any
+        // ordinary pane height - Check / Prettify / Save were unreachable exactly when a long profile made them
+        // matter, and an edit that was never saved read as the panel losing it. Parking the row in the root's
+        // SOUTH pins it under the viewport, a sibling of the scroll pane rather than a passenger in it. Same
+        // buttons, same listeners, same status label - only the parent changed.
+        // BorderLayout, not one FlowLayout row holding all four. A FlowLayout wraps when the row is wider than
+        // the pane, and SOUTH sizes the footer for ONE row - so a long verdict ("saved. auto re-sign: add a
+        // CREDENTIAL_ID locator...") wrapped the status label to a second line the band has no height for and
+        // it vanished, which is the same disappearing-feedback failure this footer exists to end. It also fed
+        // the label's width into root.getMinimumSize(), and JSplitPane honours the right component's minimum,
+        // so the divider's travel shrank every time a long message appeared. Buttons WEST at their natural
+        // size, status CENTER: a JLabel in CENTER clips with an ellipsis instead of wrapping, and the explicit
+        // zero minimum width keeps the message out of the split's arithmetic entirely.
+        JPanel buttonRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        buttonRow.add(checkButton);
+        buttonRow.add(prettifyButton);
+        buttonRow.add(saveButton);
+        status.setMinimumSize(new Dimension(0, status.getPreferredSize().height));
+        JPanel actions = new JPanel(new BorderLayout());
+        actions.add(buttonRow, BorderLayout.WEST);
+        actions.add(status, BorderLayout.CENTER);
 
         // Exactly four aligned boxes - header / Registration / Authentication / bodies. GridBag with
         // weightx=1 + fill=HORIZONTAL stretches each to the full width (so their left/right edges line up);
@@ -260,6 +319,9 @@ public final class ProfileConfigPanel {
         JScrollPane scroll = new JScrollPane(center);
         scroll.setBorder(BorderFactory.createEmptyBorder()); // drop the scrollpane outline so only the split divider shows
         this.root.add(scroll, BorderLayout.CENTER);
+        // Added AFTER the scroll pane: the layout test reads root.getComponent(0) as the outer scroll pane, and
+        // a BorderLayout keeps its children in insertion order regardless of constraint.
+        this.root.add(actions, BorderLayout.SOUTH);
         // Re-colour rather than rebuild: this panel holds what the operator typed. Registering the
         // meaning of each colour lets the panel follow a live theme change without losing that state -
         // including whatever the status line and the per-field verdicts are currently showing.
@@ -274,6 +336,10 @@ public final class ProfileConfigPanel {
             authBody.setFont(Fonts.mono());
             boxOutlines.forEach(b -> b.setBorder(BorderFactory.createLineBorder(Palette.border())));
             title.setFont(Fonts.ui().deriveFont(Font.BOLD, Fonts.ui().getSize() + 2f));
+            // A hairline across the top of the footer, so the pinned row reads as chrome under the scrolled
+            // column rather than as a detached continuation of the "Sample bodies" box it used to live in.
+            // Palette.border() (not muted, which is a TEXT colour and glows white as a border).
+            actions.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Palette.border()));
         });
         setProfile(null);
     }
@@ -322,6 +388,59 @@ public final class ProfileConfigPanel {
         } finally {
             loading = false;
         }
+        // Outside the finally: the panel now mirrors the stored profile exactly, so whatever the previous
+        // profile had pending is gone with it. Clearing here (rather than inside the try) also means a
+        // mid-load failure leaves the flag conservatively set rather than claiming the panel is clean.
+        clearDirty();
+    }
+
+    /** Whether the panel holds edits that have not been through Save. */
+    public boolean isDirty() {
+        return dirty;
+    }
+
+    /** Register the callback fired when {@link #isDirty()} flips - the profile list's repaint trigger. */
+    void setOnDirtyChanged(Runnable r) {
+        this.onDirtyChanged = r != null ? r : () -> { };
+    }
+
+    /**
+     * Run the Save action exactly as the button does, validation gate included. This is the "Save" answer to
+     * the confirm-on-switch dialog; a rejected save leaves {@link #isDirty()} true and the reason in the
+     * status line, which is how the caller knows not to proceed with the switch.
+     */
+    void saveNow() {
+        onSaveClicked();
+    }
+
+    /** Record an operator edit and surface it (bold Save + the list's marker). No-op while loading/empty. */
+    private void markDirty() {
+        if (loading || empty || dirty) {
+            return;
+        }
+        dirty = true;
+        applySaveEmphasis();
+        onDirtyChanged.run();
+    }
+
+    private void clearDirty() {
+        boolean was = dirty;
+        dirty = false;
+        applySaveEmphasis(); // unconditional: this is also what installs the plain font at construction
+        if (was) {
+            onDirtyChanged.run();
+        }
+    }
+
+    /**
+     * Mark "Save profile" while there are unsaved edits, using the same glyph the list row uses so the two
+     * cues read as one thing. The marker is in the LABEL rather than in the font because bolding is not a cue
+     * that survives this host: Burp's own look and feel declares {@code Button.font=bold}, so every button is
+     * already bold and a bold-while-dirty state is invisible in the one place it has to work. The gutter of
+     * two spaces on the clean label keeps the button's width from jumping as the flag flips.
+     */
+    private void applySaveEmphasis() {
+        saveButton.setText(dirty ? SAVE_LABEL + " \u2022" : SAVE_LABEL + "  ");
     }
 
     /**
@@ -352,13 +471,39 @@ public final class ProfileConfigPanel {
 
     private void setControlsEnabled(boolean enabled) {
         boolean on = enabled;
-        for (Component c : new Component[]{idField, nameField, hostKind, hostPattern, enabledBox, algCombo,
+        for (Component c : new Component[]{idField, nameField, hostKind, enabledBox, algCombo,
                 attestationCombo, autoPlantBox, autoResignBox, regBody, authBody, checkButton, prettifyButton,
                 saveButton}) {
             c.setEnabled(on);
         }
+        applyHostKind(); // hostPattern's enablement is this AND a non-ANY kind
         regEditor.setEnabled(on);
         authEditor.setEnabled(on);
+    }
+
+    /**
+     * The host-match counterpart of the verify-URL row's {@code applyUrlKind}. The two rows pose the operator
+     * the identical question - a combo of match kinds beside a pattern box that states no format - so they
+     * answer it identically: an example of the shape each kind expects, and under ANY a disabled box saying
+     * what is actually happening, because {@link HostMatch#matches} returns true there without reading the
+     * pattern at all. Leaving one row explained and the other bare was worse than leaving both bare: it reads
+     * as the hint being broken on the row that has none.
+     */
+    private void applyHostKind() {
+        HostMatch.Kind kind = (HostMatch.Kind) hostKind.getSelectedItem();
+        boolean scoped = kind != null && kind != HostMatch.Kind.ANY;
+        hostPattern.setEnabled(!empty && scoped);
+        if (scoped) {
+            hostPattern.setOverlay(null);
+            hostPattern.setHint(switch (kind) {
+                case EXACT -> "webauthn.io";
+                case SUFFIX -> ".hanko.io";
+                case REGEX -> ".*\\.example\\.com";
+                case ANY -> "";
+            });
+        } else {
+            hostPattern.setOverlay("every host");
+        }
     }
 
     // ---- actions -------------------------------------------------------------------------------
@@ -368,6 +513,7 @@ public final class ProfileConfigPanel {
         if (loading || empty) {
             return; // don't fire during programmatic load, or when no profile is open
         }
+        markDirty(); // every caller of this is an operator edit to a locator, an encoding or a sample body
         liveTimer.restart();
     }
 
@@ -419,6 +565,12 @@ public final class ProfileConfigPanel {
         }
         try {
             TargetProfile built = buildProfile();
+            // Clear BEFORE handing the profile to the sink. The sink rebuilds the profile list and re-selects
+            // the row it just wrote, which routes back through the list's selection handler - and that handler
+            // is now the confirm-on-switch guard. Still dirty at that moment, our own save would prompt the
+            // operator to rescue the edits it is in the middle of storing. buildProfile() above is the
+            // validation gate and throws before reaching here, so a rejected save never clears the flag.
+            clearDirty();
             onSave.accept(built);
             String warn = autoWarning(built);
             showStatus(warn == null ? "saved" : "saved. " + warn, warn == null ? Palette::ok : Palette::warn);
@@ -451,8 +603,16 @@ public final class ProfileConfigPanel {
             if (!el.isJsonObject() && !el.isJsonArray()) {
                 return 0; // a bare scalar isn't worth reformatting
             }
-            area.setText(PRETTY.toJson(el));
-            area.setCaretPosition(0);
+            String pretty = PRETTY.toJson(el);
+            // Only touch the document if the text actually changes. setText is a remove-all + insert whatever
+            // the content, so re-prettifying already-pretty JSON used to be a harmless no-op and is not one
+            // any more: it fires the document listeners, marks the profile dirty, and earns the operator a
+            // confirm dialog over an edit nobody made. Still counted as done, so the status line does not
+            // claim there was nothing to prettify.
+            if (!pretty.equals(text)) {
+                area.setText(pretty);
+                area.setCaretPosition(0);
+            }
             return 1;
         } catch (RuntimeException ex) {
             return 0; // not valid JSON → leave it untouched
@@ -544,12 +704,25 @@ public final class ProfileConfigPanel {
 
     /** The URL scope + the field rows for one phase. */
     private static final class PhaseEditor {
+        /**
+         * One line, because a tooltip is one line - see {@link UiStyle#tip}. It answers only the question the
+         * row cannot: what the pattern is measured against. What a mis-typed pattern actually costs is a
+         * paragraph, so it lives in the Guide tab instead of being crammed in here.
+         */
+        private static final String URL_TIP =
+                "Matched against the full request URL, not just the path.";
+
         private final Phase phase;
+        private final JLabel urlLabel = new JLabel("verify URL:");
         private final JComboBox<UrlMatch.Kind> urlKind = new JComboBox<>(UrlMatch.Kind.values());
-        private final JTextField urlPattern = new JTextField(22);
+        private final HintField urlPattern = new HintField(22);
         private final JTextField urlMethod = new JTextField(5);
         private final List<FieldRowEditor> rows = new ArrayList<>();
         private final JPanel panel;
+        /** The panel-wide enablement from {@link #setEnabled}; the URL field ANDs it with a non-ANY Kind. */
+        private boolean controlsEnabled;
+        /** Fired on any operator edit in this phase's URL row - the panel's unsaved-edit trigger. */
+        private Runnable onDirty = () -> { };
 
         /** Re-apply every row's verdict colour after a theme change. */
         void retint() {
@@ -565,8 +738,26 @@ public final class ProfileConfigPanel {
                 rows.add(row);
                 rowsPanel.add(row.component());
             }
+            urlLabel.setToolTipText(URL_TIP);
+            // The Kind drives more than the match algorithm: it decides whether the field means anything at
+            // all, and what shape a value should take. Everything that depends on it is re-applied in one
+            // place so the field can never disagree with the combo beside it.
+            urlKind.addActionListener(e -> {
+                applyUrlKind();
+                onDirty.run();
+            });
+            // One listener, two jobs (they would otherwise fight over the same component): it keeps the
+            // field's own tooltip mirroring what is typed - a 22-column box shows a long URL or regex through
+            // a keyhole, and hovering is the cheapest way to read the whole of it - and it reports the edit.
+            onDocumentChange(urlPattern.getDocument(), () -> {
+                updateUrlTooltip();
+                onDirty.run();
+            });
+            onDocumentChange(urlMethod.getDocument(), () -> onDirty.run());
+            updateUrlTooltip();
+            applyUrlKind();
             JPanel urlRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-            urlRow.add(new JLabel("verify URL:"));
+            urlRow.add(urlLabel);
             urlRow.add(urlKind);
             urlRow.add(urlPattern);
             urlRow.add(new JLabel("method:"));
@@ -580,7 +771,13 @@ public final class ProfileConfigPanel {
             // clipped; isValidateRoot=false lets a row's revalidate (detail expand / live-check) propagate OUT to
             // the surrounding layout - a normal JScrollPane would trap it and the expander would vanish under
             // VERTICAL_NEVER.
-            JScrollPane rowsScroll = new JScrollPane(rowsPanel,
+            //
+            // WheelForwardingScrollPane because that VERTICAL_NEVER is exactly the case Swing gets wrong: the
+            // wheel goes to the innermost scrollable under the pointer and stops there, and this pane keeps a
+            // vertical gesture it can never act on - so the config panel stopped scrolling the moment the
+            // pointer was over a field row. Vertical always forwards here; horizontal stays local, which is
+            // the whole point of this pane.
+            JScrollPane rowsScroll = new WheelForwardingScrollPane(rowsPanel,
                     JScrollPane.VERTICAL_SCROLLBAR_NEVER, JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED) {
                 @Override
                 public Dimension getPreferredSize() {
@@ -610,15 +807,73 @@ public final class ProfileConfigPanel {
         }
 
         void setEnabled(boolean on) {
+            controlsEnabled = on;
             urlKind.setEnabled(on);
-            urlPattern.setEnabled(on);
             urlMethod.setEnabled(on);
             rows.forEach(r -> r.setEnabled(on));
+            applyUrlKind(); // the pattern field's own enablement is this AND a non-ANY Kind
+        }
+
+        /**
+         * Re-apply everything the Kind combo governs. Under {@code ANY} the pattern is inert - {@link UrlMatch}
+         * short-circuits before reading it - so the field is disabled and says what is actually happening,
+         * rather than sitting there enabled and empty looking like something still to fill in. Under the other
+         * three the hint shows the shape that Kind expects, which is the one thing the row never stated: EXACT
+         * wants a whole URL, CONTAINS a fragment of one, REGEX an expression over it.
+         */
+        private void applyUrlKind() {
+            UrlMatch.Kind kind = (UrlMatch.Kind) urlKind.getSelectedItem();
+            boolean scoped = kind != null && kind != UrlMatch.Kind.ANY;
+            urlPattern.setEnabled(controlsEnabled && scoped);
+            // A method gate is equally inert under ANY - UrlMatch's compact ctor nulls it - so the two
+            // controls say the same thing rather than one looking live while the other is greyed.
+            urlMethod.setEnabled(controlsEnabled && scoped);
+            if (scoped) {
+                urlPattern.setOverlay(null);
+                urlPattern.setHint(hintFor(kind));
+            } else {
+                // Overlay, not hint: a profile loaded under ANY can still carry a pattern from an earlier
+                // Kind, and that leftover is inert. Showing it would leave the operator reading a rule that
+                // does nothing, so the state of the field is what gets displayed and the value stays on hover.
+                urlPattern.setOverlay("any URL on this host");
+            }
+        }
+
+        private static String hintFor(UrlMatch.Kind kind) {
+            return switch (kind) {
+                case EXACT -> "https://example.com/webauthn/verify";
+                case CONTAINS -> "/webauthn/verify";
+                case REGEX -> ".*/webauthn/(verify|complete)";
+                case ANY -> "any URL on this host";
+            };
+        }
+
+        /**
+         * Put the value the operator typed at the FRONT of the field's own tooltip, ahead of the format
+         * guidance, so hovering reads back a long URL or regex in full - the field is 22 columns and widening
+         * it is not free: urlRow is a FlowLayout in the phase box's NORTH slot, so a wider field wraps
+         * {@code method:} onto a second line the slot has no height for.
+         * One tooltip rather than two: the field can only carry one, and the value is what you hover for -
+         * {@link UiStyle#tip} puts it in its own block above the guidance and escapes it, which a pattern
+         * containing {@code <} needs.
+         */
+        private void updateUrlTooltip() {
+            String value = urlPattern.getText();
+            // The value alone once there is one. Appending the guidance to it was how this tooltip grew past
+            // the screen: a tooltip cannot wrap, so the two cannot share it. The guidance is a hover away on
+            // the label beside it, and it is the value you hover the FIELD for - the box is 22 columns and a
+            // full URL or regex does not fit in it.
+            urlPattern.setToolTipText(value == null || value.isBlank() ? URL_TIP : UiStyle.tip(value));
         }
 
         /** Wire every field row to trigger a debounced live re-check when its locator/encoding is edited. */
         void setLiveRecheck(Runnable r) {
             rows.forEach(row -> row.setOnEdit(r));
+        }
+
+        /** Wire this phase's URL row (Kind / pattern / method) to the panel's unsaved-edit tracking. */
+        void setOnDirty(Runnable r) {
+            this.onDirty = r != null ? r : () -> { };
         }
 
         /** How many rows have a non-blank locator configured - so Check can tell "all green" from "nothing set". */
@@ -710,7 +965,10 @@ public final class ProfileConfigPanel {
         // RESIZABLE via a drag-grip (like the sample-body boxes) so a large hex/JSON value can be extended.
         private final JButton detailsToggle = new JButton("decoded ▸");
         private final JTextArea detailArea = new JTextArea(6, 72);
-        private final JScrollPane detailScroll = new JScrollPane(detailArea);
+        // WheelForwardingScrollPane for the same reason as the body boxes: expanded, this box sits under the
+        // pointer and would otherwise eat every wheel gesture, including with no scrollbar of its own. It
+        // forwards to rowsScroll, which forwards again to the outer pane.
+        private final JScrollPane detailScroll = new WheelForwardingScrollPane(detailArea);
         /**
          * detailScroll + resize grip; toggled visible.
          *
@@ -824,9 +1082,11 @@ public final class ProfileConfigPanel {
             detailsToggle.setEnabled(false);
             detailsToggle.setMargin(new Insets(0, 6, 0, 6));
             detailsToggle.setFocusable(false);
-            detailsToggle.setToolTipText("Show the FULL decoded value: for attestationObject / "
-                    + "authenticatorData / clientDataJSON the same structured JSON the Passkey Editor tab shows, "
-                    + "otherwise encoding, byte length, full hex and ASCII when printable. Drag the corner grip to resize.");
+            // One line, like every tooltip here (see UiStyle.tip) - at 242 characters this rendered 1455px
+            // wide, and it repeats on all nine field rows. Which fields get structured JSON is answered by
+            // expanding it, and the resize hint is carried by the grip's own tooltip, on the grip.
+            detailsToggle.setToolTipText("Show the full decoded value: structured JSON for the CBOR fields, "
+                    + "otherwise encoding, length, hex and ASCII.");
             detailsToggle.addActionListener(ev -> setDetailExpanded(!detailExpanded));
             detailArea.setEditable(false);
             detailArea.setLineWrap(true);
@@ -1038,7 +1298,7 @@ public final class ProfileConfigPanel {
                 clearResult();
                 result.setText(invalidPath.getMessage() != null ? invalidPath.getMessage() : "invalid path");
                 showVerdict(Status.NOT_FOUND);
-                result.setToolTipText(result.getText());
+                result.setToolTipText(UiStyle.tip(result.getText()));
                 return Status.NOT_FOUND;
             }
             if (loc == null) {
@@ -1058,9 +1318,13 @@ public final class ProfileConfigPanel {
             // truncated concise line never hides why a field is SUSPECT/NOT_FOUND or what was located.
             String tip = r.note() != null ? r.note() : "";
             if (r.located() != null) {
-                tip = (tip.isEmpty() ? "" : tip + ", ") + "[" + r.encoding() + "] located: " + r.located();
+                // Abbreviated: this is the value off the wire, so its length is the RP's choice, not ours -
+                // a located attestationObject measured 3745px here, the widest tooltip in the extension. The
+                // prefix is enough to recognise what was found; the whole value is what "decoded" is for.
+                tip = (tip.isEmpty() ? "" : tip + ", ") + "[" + r.encoding() + "] located: "
+                        + UiStyle.abbreviate(r.located(), 56);
             }
-            result.setToolTipText(tip.isEmpty() ? null : tip);
+            result.setToolTipText(UiStyle.tip(tip));
             // stash the decoded bytes for the expander. Enable the toggle only when bytes decoded;
             // if the detail is currently open, refresh it to this new Check result (else leave it collapsed).
             lastBytes = r.decodedBytes();
@@ -1087,6 +1351,9 @@ public final class ProfileConfigPanel {
      */
     private void showStatus(String text, Supplier<Color> tone) {
         status.setText(text);
+        // The label clips with an ellipsis when the footer is narrow, so the whole message stays reachable on
+        // hover. A blank status carries no tooltip rather than an empty one.
+        status.setToolTipText(UiStyle.tip(text));
         root.tint(status, tone);
     }
 
@@ -1120,7 +1387,10 @@ public final class ProfileConfigPanel {
     }
 
     private JPanel labeled(String label, JTextArea area) {
-        JScrollPane scroll = new JScrollPane(area);
+        // WheelForwardingScrollPane: a body box is a scrollable inside the panel's own scroll pane, so a wheel
+        // gesture with the pointer over it stops here. Forwarding once this box is at its own top/bottom keeps
+        // the outer column scrolling instead of the wheel appearing to die over a text area.
+        JScrollPane scroll = new WheelForwardingScrollPane(area);
         scroll.setBorder(BorderFactory.createEmptyBorder()); // the box outline below wraps scroll + grip as one
         // Grip lives in its own strip INSIDE the box outline (not overlapping the scroll pane) - an overlay
         // would get overpainted whenever the scroll pane repaints (e.g. after Prettify) and vanish. The strip is
@@ -1150,6 +1420,164 @@ public final class ProfileConfigPanel {
             p.add(c);
         }
         return p;
+    }
+
+    /**
+     * A scroll pane that hands a wheel gesture up to the enclosing scroll pane once it has no room left in
+     * that axis.
+     *
+     * Swing delivers a wheel event to the innermost wheel-enabled component under the pointer and stops there -
+     * a component that has the event but does nothing with it does NOT pass it on. Every scroll pane is
+     * wheel-enabled, so an inner one swallows the gesture even in an axis it cannot move: over the field rows
+     * (VERTICAL_SCROLLBAR_NEVER) the panel simply stopped scrolling, and over a body box it stopped as soon as
+     * that box hit its own end.
+     *
+     * The decision is taken in {@code processMouseWheelEvent} rather than in a {@code MouseWheelListener}
+     * because it has to happen BEFORE the look and feel's own wheel listener, and a listener cannot: they fire
+     * in registration order and the L&F's is installed by the constructor, so anything client code adds runs
+     * only after the L&F has already consumed the event and scrolled the wrong bar. Getting ahead of it means
+     * surgery on the pane's listener list, and an L&F change - which Burp performs live on a theme switch -
+     * tears that list down and rebuilds it, taking the removed handler with it. Overriding here is
+     * order-independent, and delegating to {@code super} for the local case reuses the L&F's exact scroll
+     * arithmetic rather than reimplementing it.
+     */
+    private static class WheelForwardingScrollPane extends JScrollPane {
+
+        WheelForwardingScrollPane(Component view) {
+            super(view);
+        }
+
+        WheelForwardingScrollPane(Component view, int verticalPolicy, int horizontalPolicy) {
+            super(view, verticalPolicy, horizontalPolicy);
+        }
+
+        @Override
+        protected void processMouseWheelEvent(MouseWheelEvent e) {
+            JScrollPane outer = hasRoomFor(e)
+                    ? null
+                    : (JScrollPane) SwingUtilities.getAncestorOfClass(JScrollPane.class, this);
+            if (outer == null) {
+                super.processMouseWheelEvent(e); // room left here, or nothing to forward to - scroll normally
+                return;
+            }
+            // convertMouseEvent re-sources a MouseWheelEvent as one (preserving scroll type, amount and the
+            // precise rotation a trackpad sends), which a hand-built MouseEvent would quietly drop.
+            outer.dispatchEvent(SwingUtilities.convertMouseEvent(this, e, outer));
+            e.consume();
+        }
+
+        /**
+         * Whether this pane can still move in the wheel's own axis. A {@code *_SCROLLBAR_NEVER} policy is
+         * "never can" regardless of what the model says - the bar exists but is never shown, and the L&F would
+         * otherwise answer a vertical gesture by scrolling the HORIZONTAL bar instead.
+         *
+         * Shift means "horizontal" because that is the convention Swing itself scrolls by: BasicScrollPaneUI's
+         * own wheel handler switches to the horizontal bar on {@code isShiftDown()}. Reading the axis the same
+         * way keeps this pane's answer and the L&F's answer about the same gesture from disagreeing.
+         */
+        private boolean hasRoomFor(MouseWheelEvent e) {
+            boolean horizontal = e.isShiftDown();
+            int policy = horizontal ? getHorizontalScrollBarPolicy() : getVerticalScrollBarPolicy();
+            if (policy == (horizontal ? HORIZONTAL_SCROLLBAR_NEVER : VERTICAL_SCROLLBAR_NEVER)) {
+                return false;
+            }
+            JScrollBar bar = horizontal ? getHorizontalScrollBar() : getVerticalScrollBar();
+            if (bar == null || !bar.isVisible()) {
+                return false; // nothing to scroll in this axis: the content fits
+            }
+            // getPreciseWheelRotation, not getWheelRotation: the int one stays 0 on a high-resolution device
+            // until a whole click has accumulated, so a slow trackpad swipe emits a run of rotation-0 events
+            // that would all be read as "downward" and tested against the wrong end of the range. The precise
+            // value carries the real direction and equals the int rotation for a classic wheel. It matters
+            // here specifically: Burp's look and feel scrolls smoothly off the precise value.
+            return e.getPreciseWheelRotation() < 0
+                    ? bar.getValue() > bar.getMinimum()
+                    : bar.getValue() + bar.getVisibleAmount() < bar.getMaximum();
+        }
+    }
+
+    /**
+     * A single-line field that paints a grey hint over itself while it is empty and unfocused.
+     *
+     * Used for the verify-URL pattern, which is the one field in this panel with no self-evident format: it
+     * sits next to a Kind combo whose four values each expect a different shape of value, and the operator on
+     * Burp Community retypes it every session (profiles do not survive a restart there). Painted rather than
+     * inserted as placeholder text so the document stays genuinely empty - {@code toPhaseSpec} reads it
+     * directly, and a hint that could be saved as a pattern would be worse than no hint at all.
+     */
+    private static final class HintField extends JTextField {
+
+        private String hint = "";
+        /** Painted over the field's own text when set - for a state where the stored value does not apply. */
+        private String overlay;
+
+        HintField(int columns) {
+            super(columns);
+        }
+
+        void setHint(String hint) {
+            this.hint = hint != null ? hint : "";
+            repaint();
+        }
+
+        /** Replace what the field shows with {@code text} (null to go back to showing the document). */
+        void setOverlay(String text) {
+            this.overlay = text;
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            if (overlay != null) {
+                // Paint the field empty first, then the overlay, so the inert value underneath does not show
+                // through. getText() is deliberately not consulted: the point is that it does not apply.
+                paintBlank(g);
+                drawGrey(g, overlay);
+                return;
+            }
+            super.paintComponent(g);
+            // Shown for as long as the field is empty, focused or not. Hiding it on focus is the common
+            // placeholder idiom and it is wrong here: the operator clicks into this field precisely because
+            // they do not know what shape of value it wants, and that click is what would take the answer
+            // away. Typing removes it, which is the only moment it stops being the thing you need.
+            if (hint.isEmpty() || !getText().isEmpty()) {
+                return;
+            }
+            drawGrey(g, hint);
+        }
+
+        /**
+         * The field's own chrome with no text in it - the ground the overlay is written onto. The colour comes
+         * from the look and feel's key for the field's CURRENT state, not from getBackground(): the overlay is
+         * only ever shown on a disabled field, and a look and feel that greys a disabled field (Burp's does)
+         * would otherwise get the enabled colour painted back over it and the field would look live again.
+         */
+        private void paintBlank(Graphics g) {
+            if (!isOpaque()) {
+                return;
+            }
+            Color bg = UIManager.getColor(isEnabled() ? "TextField.background" : "TextField.disabledBackground");
+            g.setColor(bg != null ? bg : getBackground());
+            g.fillRect(0, 0, getWidth(), getHeight());
+        }
+
+        private void drawGrey(Graphics g, String text) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setColor(Palette.muted()); // muted is the palette's TEXT grey, which is what this is
+                g2.setFont(getFont().deriveFont(Font.ITALIC));
+                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                        RenderingHints.VALUE_TEXT_ANTIALIAS_ON); // else the hint reads rougher than real text
+                Insets in = getInsets();
+                g2.clipRect(in.left, in.top, Math.max(0, getWidth() - in.left - in.right),
+                        Math.max(0, getHeight() - in.top - in.bottom)); // never draw past the field's border
+                FontMetrics fm = g2.getFontMetrics();
+                int usable = getHeight() - in.top - in.bottom;
+                g2.drawString(text, in.left, in.top + (usable - fm.getHeight()) / 2 + fm.getAscent());
+            } finally {
+                g2.dispose();
+            }
+        }
     }
 
     /**

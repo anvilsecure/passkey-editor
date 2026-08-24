@@ -56,8 +56,15 @@ public final class GuidePanel {
                   (<code>userHandle</code> is only sent for a discoverable credential)</li>
             </ul>
           </li>
-          <li><b>Save profile</b>. Nothing you typed takes effect until you do, and selecting another
-              profile first discards it.</li>
+          <li><b>Scope it, if the host carries more than one endpoint.</b> <b>host match</b> is measured
+              against the host of the ceremony request - often a tenant or API host, not the site in the
+              address bar. <b>verify URL</b> is measured against the whole request URL, not just the path.
+              Both are optional: leave a pattern blank, or set its kind to <b>ANY</b>, and that dimension
+              scopes nothing. A pattern that never matches is not reported as an error - the tab simply
+              stops appearing for that phase and AUTO stops acting on it, so a typo here shows up as
+              silence rather than a message.</li>
+          <li><b>Save profile</b>. Nothing you typed takes effect until you do; the profile row is marked
+              while edits are pending, and selecting another profile asks you first.</li>
           <li><b>Enable</b> the profile and <b>Save</b> again. The ceremony tab now extracts exactly
               what Check showed.</li>
         </ol>
@@ -84,7 +91,8 @@ public final class GuidePanel {
               never be armed for AUTO because it matches every host. Disable every profile, the Default
               included, and the extension touches nothing.</li>
           <li><b>Profiles are saved in the Burp project.</b> Whatever you <b>save</b> comes back when
-              you reopen that project; unsaved edits are lost the moment you select another profile.
+              you reopen that project; pending edits are marked in the list, and anything that would
+              discard them asks first.
               A new project starts with the Default alone, so the targets in the list are always the
               ones you put there. Persistence needs a saved project file, so it is a Burp Professional
               feature - Community's temporary projects have nowhere to store it.</li>
@@ -105,7 +113,9 @@ public final class GuidePanel {
         """.formatted(ORANGE, CHANGED);
 
     private static final String AUTO = """
-        <p style='margin:0 0 6px 0'>Two per-profile switches, both off until you arm them:</p>
+        <p style='margin:0 0 6px 0'>Two per-profile switches, both off until you arm them. Arming either one
+        ticks <b>Enabled</b> for you; un-ticking <b>Enabled</b> disarms both, so one click stands a
+        fully-armed profile down.</p>
         <ul style='margin:0 0 8px 16px'>
           <li><b>Auto-plant (reg)</b> rewrites a registration so the relying party stores a key this
               extension generated and keeps the private half of, in place of the real authenticator's.
